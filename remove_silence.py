@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Measure each m4a file's noise floor and close-mic speech level.
+"""Report which spans of each m4a file the noise gate would keep.
 
-A short analysis pass decodes to 16 kHz mono and reports where room tone
-and the close-mic peak sit. Originals are left untouched.
+Each track is processed independently. A short analysis pass finds the
+noise floor and close-mic peak, then gates a little above the floor so
+quiet speech is kept. Originals are left untouched.
 """
 
 from __future__ import annotations
@@ -211,6 +212,61 @@ def identify_main_speaker(dbs: list[float]) -> dict[str, float]:
     }
 
 
+def keep_intervals(
+    dbs: list[float],
+    threshold_db: float,
+    min_silence: float,
+    pad: float,
+) -> list[tuple[float, float]]:
+    """Return [start, end) times in seconds that should be kept."""
+    n = len(dbs)
+    if n == 0:
+        return []
+    frame_s = FRAME_MS / 1000.0
+    is_speech = [db >= threshold_db for db in dbs]
+
+    pad_frames = max(1, int(round(pad / frame_s)))
+    filled = is_speech[:]
+    last_speech = -10**9
+    for i, speech in enumerate(is_speech):
+        if speech:
+            last_speech = i
+        elif i - last_speech <= pad_frames:
+            filled[i] = True
+    next_speech = 10**9
+    for i in range(n - 1, -1, -1):
+        if is_speech[i]:
+            next_speech = i
+        elif next_speech - i <= pad_frames:
+            filled[i] = True
+
+    intervals: list[tuple[float, float]] = []
+    i = 0
+    while i < n:
+        if not filled[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and filled[j]:
+            j += 1
+        intervals.append((i * frame_s, j * frame_s))
+        i = j
+
+    if not intervals:
+        return []
+
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        prev_start, prev_end = merged[-1]
+        if start - prev_end < min_silence:
+            merged[-1] = (prev_start, end)
+        else:
+            merged.append((start, end))
+
+    duration = n * frame_s
+    return [(max(0.0, s), min(duration, e)) for s, e in merged if e - s > 0.05]
+
+
 def collect_files(paths: list[Path]) -> list[Path]:
     if paths:
         files = []
@@ -225,38 +281,81 @@ def collect_files(paths: list[Path]) -> list[Path]:
     return files
 
 
+def parse_threshold(value: str) -> float | None:
+    if value.lower() == "auto":
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "threshold must be 'auto' or a dBFS number like -35"
+        ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "files",
         nargs="*",
         type=Path,
-        help="m4a files to measure (default: all .m4a in the current directory)",
+        help="m4a files to process (default: all .m4a in the current directory)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=parse_threshold,
+        default=None,
+        help="silence threshold in dBFS, or 'auto' to measure each track (default: auto)",
+    )
+    parser.add_argument(
+        "--min-silence",
+        type=float,
+        default=0.5,
+        help="only drop quiet stretches at least this long, in seconds",
+    )
+    parser.add_argument(
+        "--pad",
+        type=float,
+        default=0.2,
+        help="keep this many seconds of audio around each speech region",
     )
     return parser.parse_args()
 
 
-def process_file(path: Path) -> None:
+def process_file(path: Path, args: argparse.Namespace) -> None:
     info = stream_info(path)
+    original = info["duration"]
     print(f"{path.name}")
-    print(f"  original  : {format_hms(info['duration'])}")
+    print(f"  original  : {format_hms(original)}")
 
     print("  measuring : noise floor and close-mic peak")
     dbs = rms_db_frames(path)
-    stats = identify_main_speaker(dbs)
-    print(f"  noise     : {stats['noise']:.1f} dBFS")
-    print(f"  main spk  : {stats['main_speaker']:.1f} dBFS")
-    if stats["bleed"] == stats["bleed"]:
-        print(f"  bleed     : {stats['bleed']:.1f} dBFS")
+    if args.threshold is None:
+        stats = identify_main_speaker(dbs)
+        threshold = stats["threshold"]
+        print(f"  noise     : {stats['noise']:.1f} dBFS")
+        print(f"  main spk  : {stats['main_speaker']:.1f} dBFS")
+        if stats["bleed"] == stats["bleed"]:
+            print(f"  bleed     : {stats['bleed']:.1f} dBFS")
+        else:
+            print("  bleed     : none detected")
     else:
-        print("  bleed     : none detected")
+        threshold = args.threshold
+
+    intervals = keep_intervals(dbs, threshold, args.min_silence, args.pad)
+    kept = sum(end - start for start, end in intervals)
+    print(f"  threshold : {threshold:.1f} dBFS")
+    print(f"  regions   : {len(intervals)} speech segment(s)")
+    print(f"  kept      : {format_hms(kept)}  ({100.0 * kept / original:.1f}%)")
+    print(f"  removed   : {format_hms(original - kept)}")
+    if not intervals:
+        print("  skipped   : no speech detected")
 
 
 def main() -> None:
     args = parse_args()
     require_ffmpeg()
     for path in collect_files(args.files):
-        process_file(path)
+        process_file(path, args)
 
 
 if __name__ == "__main__":
