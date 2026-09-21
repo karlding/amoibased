@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Report which spans of each m4a file the noise gate would keep.
+"""Remove silence from each m4a file, with a per-track noise gate.
 
 Each track is processed independently. A short analysis pass finds the
 noise floor and close-mic peak, then gates a little above the floor so
-quiet speech is kept. Originals are left untouched.
+quiet speech is kept. Speech regions are concatenated
+with short fades so joins do not click. Originals are left untouched;
+stripped files go to trimmed/.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from pathlib import Path
 ANALYSIS_RATE = 16_000
 FRAME_MS = 20
 BYTES_PER_S16 = 2
+FADE_S = 0.02
 
 
 def die(message: str, code: int = 1) -> None:
@@ -267,6 +270,149 @@ def keep_intervals(
     return [(max(0.0, s), min(duration, e)) for s, e in merged if e - s > 0.05]
 
 
+def cosine_gain(i: int, n: int) -> float:
+    if n <= 1:
+        return 1.0
+    return 0.5 - 0.5 * math.cos(math.pi * i / n)
+
+
+def fade_chunk(
+    data: bytes,
+    channels: int,
+    frame_offset: int,
+    region_frames: int,
+    fade_in: int,
+    fade_out: int,
+) -> bytes:
+    n_frames = len(data) // (BYTES_PER_S16 * channels)
+    start = frame_offset
+    end = frame_offset + n_frames
+    needs_in = start < fade_in
+    needs_out = end > region_frames - fade_out
+    if not needs_in and not needs_out:
+        return data
+
+    samples = array.array("h")
+    samples.frombytes(data)
+    for i in range(n_frames):
+        abs_i = frame_offset + i
+        gain = 1.0
+        if abs_i < fade_in:
+            gain = cosine_gain(abs_i, fade_in)
+        tail = region_frames - 1 - abs_i
+        if tail < fade_out:
+            gain *= cosine_gain(tail, fade_out)
+        if gain != 1.0:
+            for ch in range(channels):
+                idx = i * channels + ch
+                samples[idx] = int(samples[idx] * gain)
+    return samples.tobytes()
+
+
+def render_stripped(
+    src: Path,
+    dst: Path,
+    info: dict,
+    intervals: list[tuple[float, float]],
+    fade_s: float,
+) -> None:
+    sr = info["sample_rate"]
+    ch = info["channels"]
+    bitrate = max(96_000, min(256_000, info["bit_rate"]))
+    bytes_per_frame = BYTES_PER_S16 * ch
+    keep_samples = [(int(start * sr), int(end * sr)) for start, end in intervals]
+
+    decode = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            str(ch),
+            "-ar",
+            str(sr),
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    encode = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            str(ch),
+            "-ar",
+            str(sr),
+            "-i",
+            "pipe:0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            str(bitrate),
+            str(dst),
+        ],
+        stdin=subprocess.PIPE,
+    )
+    assert decode.stdout is not None and encode.stdin is not None
+
+    def skip(n_frames: int) -> None:
+        remaining = n_frames
+        while remaining > 0:
+            n = min(remaining, 65_536)
+            data = read_exact(decode.stdout, n * bytes_per_frame)
+            if not data:
+                return
+            remaining -= len(data) // bytes_per_frame
+
+    def copy_faded(n_frames: int) -> None:
+        fade = min(int(fade_s * sr), max(0, n_frames // 2))
+        remaining = n_frames
+        pos = 0
+        while remaining > 0:
+            n = min(remaining, 65_536)
+            data = read_exact(decode.stdout, n * bytes_per_frame)
+            if not data:
+                return
+            got = len(data) // bytes_per_frame
+            data = fade_chunk(data, ch, pos, n_frames, fade, fade)
+            encode.stdin.write(data)
+            remaining -= got
+            pos += got
+
+    try:
+        pos = 0
+        for start, end in keep_samples:
+            if start > pos:
+                skip(start - pos)
+                pos = start
+            if end > pos:
+                copy_faded(end - pos)
+                pos = end
+    finally:
+        decode.stdout.close()
+        encode.stdin.close()
+        decode.wait()
+        encode.wait()
+
+    if encode.returncode not in (0, None):
+        die(f"ffmpeg encode failed for {dst.name}")
+
+
 def collect_files(paths: list[Path]) -> list[Path]:
     if paths:
         files = []
@@ -301,6 +447,13 @@ def parse_args() -> argparse.Namespace:
         help="m4a files to process (default: all .m4a in the current directory)",
     )
     parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=Path("trimmed"),
+        help="directory for stripped files (default: trimmed/)",
+    )
+    parser.add_argument(
         "--threshold",
         type=parse_threshold,
         default=None,
@@ -318,10 +471,22 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="keep this many seconds of audio around each speech region",
     )
+    parser.add_argument(
+        "--fade",
+        type=float,
+        default=FADE_S,
+        help="fade in/out at each join, in seconds (default: 0.02)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="measure gates and print timings without writing files",
+    )
     return parser.parse_args()
 
 
 def process_file(path: Path, args: argparse.Namespace) -> None:
+    dest = args.output_dir / path.name
     info = stream_info(path)
     original = info["duration"]
     print(f"{path.name}")
@@ -344,11 +509,17 @@ def process_file(path: Path, args: argparse.Namespace) -> None:
     intervals = keep_intervals(dbs, threshold, args.min_silence, args.pad)
     kept = sum(end - start for start, end in intervals)
     print(f"  threshold : {threshold:.1f} dBFS")
+    print(f"  fade      : {args.fade * 1000:.0f} ms at each join")
     print(f"  regions   : {len(intervals)} speech segment(s)")
     print(f"  kept      : {format_hms(kept)}  ({100.0 * kept / original:.1f}%)")
     print(f"  removed   : {format_hms(original - kept)}")
-    if not intervals:
-        print("  skipped   : no speech detected")
+    if args.dry_run or not intervals:
+        if not intervals:
+            print("  skipped   : no speech detected")
+        return
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  writing   : {dest}")
+    render_stripped(path, dest, info, intervals, args.fade)
 
 
 def main() -> None:
